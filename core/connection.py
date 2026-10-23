@@ -9,8 +9,6 @@ import queue
 import asyncio
 import threading
 import traceback
-import subprocess
-import websockets
 import opuslib_next
 import numpy as np
 
@@ -32,7 +30,6 @@ from core.providers.tts.default import DefaultTTS
 from concurrent.futures import ThreadPoolExecutor
 from core.utils.dialogue import Message, Dialogue
 from core.providers.asr.dto.dto import InterfaceType
-from core.handle.textHandle import handleTextMessage
 from core.providers.tools.unified_tool_handler import UnifiedToolHandler
 from plugins_func.loadplugins import auto_import_modules
 from plugins_func.register import Action, ActionResponse, all_function_registry, module_func_map
@@ -101,7 +98,7 @@ class ConnectionHandler:
 
         self.read_config_from_api = self.config.get("read_config_from_api", False)
 
-        self.websocket: websockets.ServerConnection | None = None
+        self.websocket = None  # HTTP-only mode: FakeWebSocket adapter
         self.headers = None
         self.device_id = None
         self.client_ip = None
@@ -110,7 +107,7 @@ class ConnectionHandler:
         self.max_output_size = 0
         self.chat_history_conf = 0
         self.audio_format = "opus"
-        self.sample_rate = 24000  # 默认采样率，从客户端 hello 消息中动态更新
+        self.sample_rate = 16000  # 纯HTTP模式默认16kHz（ASR/TTS/opus统一）
 
         # 客户端状态相关
         self.client_abort = False
@@ -265,275 +262,6 @@ class ConnectionHandler:
                 self.logger.bind(tag=TAG).error(
                     f"保存记忆后关闭连接失败: {close_error}"
                 )
-
-    async def _discard_message_with_bind_prompt(self):
-        """丢弃消息并检查是否需要播放绑定提示"""
-        current_time = time.time()
-        # 检查是否需要播放绑定提示
-        if current_time - self.last_bind_prompt_time >= self.bind_prompt_interval:
-            self.last_bind_prompt_time = current_time
-            # 复用现有的绑定提示逻辑
-            from core.handle.receiveAudioHandle import check_bind_device
-
-            asyncio.create_task(check_bind_device(self))
-
-    async def _route_message(self, message):
-        """消息路由"""
-        # 检查是否已经获取到真实的绑定状态
-        if not self.bind_completed_event.is_set():
-            # 还没有获取到真实状态，等待直到获取到真实状态或超时
-            try:
-                await asyncio.wait_for(self.bind_completed_event.wait(), timeout=1)
-            except asyncio.TimeoutError:
-                # 超时仍未获取到真实状态，丢弃消息
-                await self._discard_message_with_bind_prompt()
-                return
-
-        # 已经获取到真实状态，检查是否需要绑定
-        if self.need_bind:
-            # 需要绑定，丢弃消息
-            await self._discard_message_with_bind_prompt()
-            return
-
-        # 不需要绑定，继续处理消息
-
-        if isinstance(message, str):
-            await handleTextMessage(self, message)
-        elif isinstance(message, bytes):
-            if self.vad is None or self.asr is None:
-                return
-
-            # 处理来自MQTT网关的音频包
-            if self.conn_from_mqtt_gateway and len(message) >= 16:
-                handled = await self._process_mqtt_audio_message(message)
-                if handled:
-                    return
-
-            # 入口处直接解码PCM，避免VAD和ASR重复解码
-            pcm_frame = self._decode_opus_packet(message)
-            if pcm_frame:
-                self.asr_audio_queue.put(pcm_frame)
-
-    async def _process_mqtt_audio_message(self, message):
-        """
-        处理来自MQTT网关的音频消息，解析16字节头部并提取音频数据，在入队前进行AEC处理
-
-        Args:
-            message: 包含头部的音频消息
-
-        Returns:
-            bool: 是否成功处理了消息
-        """
-        try:
-            # 解析timestamp
-            timestamp = int.from_bytes(message[8:12], "big")
-
-            audio_data = message[16:]
-            # 入口直接解码PCM
-            pcm_frame = self._decode_opus_packet(audio_data)
-            if not pcm_frame:
-                return True
-
-            # AEC处理：如果timestamp>0且启用了AEC
-            if timestamp > 0 and self.client_aec:
-                pcm_frame = self._apply_aec(timestamp, pcm_frame)
-
-            self.asr_audio_queue.put(pcm_frame)
-            return True
-        except Exception as e:
-            self.logger.bind(tag=TAG).error(f"解析WebSocket音频包失败: {e}")
-
-        # 处理失败，返回False表示需要继续处理
-        return False
-
-    def _apply_aec(self, timestamp: int, pcm_frame: bytes) -> bytes:
-        """应用AEC处理 - 综合算法：互相关延迟估计 + Wiener滤波 + 频谱减法"""
-        try:
-            if not pcm_frame or len(pcm_frame) == 0:
-                return pcm_frame
-
-            if not hasattr(self, "aec_audio_cache") or not self.aec_audio_cache:
-                return pcm_frame
-
-            mic_audio = np.frombuffer(pcm_frame, dtype=np.int16).astype(np.float32)
-            mic_rms = np.sqrt(np.mean(mic_audio ** 2))
-
-            if mic_rms < 100:
-                return pcm_frame
-
-            sorted_timestamps = sorted(self.aec_audio_cache.keys())
-            if len(sorted_timestamps) < 2:
-                return pcm_frame
-
-            # ========== 匹配参考帧（对数功率谱匹配） ==========
-            n = len(mic_audio)
-
-            # 找最接近的timestamp作为起点
-            closest_idx = min(range(len(sorted_timestamps)), key=lambda i: abs(sorted_timestamps[i] - timestamp))
-
-            # 预计算 mic_audio 的对数功率谱（循环内共用，避免重复FFT）
-            mic_window = np.hanning(n)
-            mic_fft = np.fft.rfft(mic_audio * mic_window)
-            mic_psd = np.abs(mic_fft) ** 2
-            mic_log_psd = 10 * np.log10(mic_psd + 1e-8)
-            mic_P_xx = np.dot(mic_log_psd, mic_log_psd)
-
-            # 用对数功率谱匹配找最佳帧：前后各找2帧
-            best_corr = -1
-            best_ref_idx = closest_idx
-            best_ref_rms = 0.0
-
-            for offset in range(-2, 3):  # T-2, T-1, T, T+1, T+2
-                test_idx = closest_idx + offset
-                if test_idx < 0 or test_idx >= len(sorted_timestamps):
-                    continue
-                test_ts = sorted_timestamps[test_idx]
-                test_ref = np.frombuffer(self.aec_audio_cache[test_ts], dtype=np.int16).astype(np.float32)
-                test_ref_rms = np.sqrt(np.mean(test_ref ** 2))
-                if test_ref_rms < 50:
-                    continue
-
-                # 对数功率谱相关性
-                test_window = np.hanning(len(test_ref))
-                test_fft = np.fft.rfft(test_ref * test_window)
-                test_psd = np.abs(test_fft) ** 2
-                test_log_psd = 10 * np.log10(test_psd + 1e-8)
-                P_xy = np.dot(mic_log_psd, test_log_psd)
-                P_yy = np.dot(test_log_psd, test_log_psd)
-                corr = abs(P_xy) / (np.sqrt(mic_P_xx) * np.sqrt(P_yy) + 1e-8)
-
-                if corr > best_corr:
-                    best_corr = corr
-                    best_ref_idx = test_idx
-                    best_ref_rms = test_ref_rms
-
-            best_ts = sorted_timestamps[best_ref_idx]
-            best_ref = np.frombuffer(self.aec_audio_cache[best_ts], dtype=np.int16).astype(np.float32)
-            ref_rms = best_ref_rms
-
-            if ref_rms < 50:
-                return pcm_frame
-
-            # 对齐参考信号（直接截取相同长度）
-            aligned_ref = best_ref[:n]
-            if len(aligned_ref) < n:
-                aligned_ref = np.pad(aligned_ref, (0, n - len(aligned_ref)))
-
-            # ========== 频域 AEC 处理（谱减法） ==========
-            # 时域信号经过声学路径后相位失真，导致时域相关性低且P_xy正负不定
-            # 频域幅度谱不受相位影响，对数功率谱相关性稳定在0.97+
-            # 公式：result_mag = max(|mic_fft| - |ref_fft| * scale * coef, 0)
-
-            mic_mag = np.abs(mic_fft)
-            mic_phase = np.angle(mic_fft)
-            ref_fft = np.fft.rfft(aligned_ref * np.hanning(n))
-            ref_mag = np.abs(ref_fft)
-
-            # 频域计算回声比例 scale
-            scale = np.sum(mic_mag * ref_mag) / (np.dot(ref_mag, ref_mag) + 1e-8)
-
-            # 自适应系数：根据scale和coh动态调整
-            # scale大（回声强）-> coef大；coh高（匹配准）-> coef大
-            raw_coef = 1.0 + scale * 3 + (best_corr - 0.97) * 30
-            coef = max(0.5, min(3.0, raw_coef))
-
-            # 谱减法（过减 + 半波整流）
-            echo_mag = ref_mag * scale * coef
-            result_mag = np.maximum(mic_mag - echo_mag * 1.5, mic_mag * 0.1)
-
-            # 保留相位重建信号
-            result_fft = result_mag * np.exp(1j * mic_phase)
-            output = np.fft.irfft(result_fft, n)
-
-            # 高置信度是纯回声时，再压一下确保VAD检测不到
-            if best_corr >= 0.97 and ref_rms > 500:
-                output = output * 0.3
-
-            # 后处理：限幅
-            output = np.clip(output, -32768, 32767)
-
-            # 转换为bytes
-            result = output.astype(np.int16).tobytes()
-
-            return result
-
-        except Exception as e:
-            self.logger.bind(tag=TAG).warning(f"[AEC] 处理失败: {e}")
-            return pcm_frame
-
-    def _decode_opus_packet(self, opus_packet: bytes) -> bytes:
-        """
-        解码Opus数据包为PCM数据
-
-        Args:
-            opus_packet: Opus编码的音频数据
-
-        Returns:
-            bytes: 解码后的PCM数据，失败返回None
-        """
-        try:
-            if not opus_packet or len(opus_packet) == 0:
-                return None
-
-            self._init_connection_state(self)
-            pcm_frame = self._connection_opus_decoder.decode(opus_packet, 960)
-            return pcm_frame
-        except Exception as e:
-            self.logger.bind(tag=TAG).debug(f"Opus解码失败: {e}")
-            return None
-
-    def _init_connection_state(self, conn):
-        """为连接初始化独立的Opus解码器"""
-        if not hasattr(conn, "_connection_opus_decoder"):
-            conn._connection_opus_decoder = opuslib_next.Decoder(16000, 1)
-
-    async def handle_restart(self, message):
-        """处理服务器重启请求"""
-        try:
-
-            self.logger.bind(tag=TAG).info("收到服务器重启指令，准备执行...")
-
-            # 发送确认响应
-            await self.websocket.send(
-                json.dumps(
-                    {
-                        "type": "server",
-                        "status": "success",
-                        "message": "服务器重启中...",
-                        "content": {"action": "restart"},
-                    }
-                )
-            )
-
-            # 异步执行重启操作
-            def restart_server():
-                """实际执行重启的方法"""
-                time.sleep(1)
-                self.logger.bind(tag=TAG).info("执行服务器重启...")
-                subprocess.Popen(
-                    [sys.executable, "app.py"],
-                    stdin=sys.stdin,
-                    stdout=sys.stdout,
-                    stderr=sys.stderr,
-                    start_new_session=True,
-                )
-                os._exit(0)
-
-            # 使用线程执行重启避免阻塞事件循环
-            threading.Thread(target=restart_server, daemon=True).start()
-
-        except Exception as e:
-            self.logger.bind(tag=TAG).error(f"重启失败: {str(e)}")
-            await self.websocket.send(
-                json.dumps(
-                    {
-                        "type": "server",
-                        "status": "error",
-                        "message": f"Restart failed: {str(e)}",
-                        "content": {"action": "restart"},
-                    }
-                )
-            )
 
     def _initialize_components(self):
         try:
@@ -1636,68 +1364,6 @@ class ConnectionHandler:
         self.asr_audio.clear()
 
         self.logger.bind(tag=TAG).debug("All audio states reset.")
-
-    def chat_and_close(self, text):
-        """Chat with the user and then close the connection"""
-        try:
-            # Use the existing chat method
-            self.chat(text)
-
-            # After chat is complete, close the connection
-            self.close_after_chat = True
-        except Exception as e:
-            self.logger.bind(tag=TAG).error(f"Chat and close error: {str(e)}")
-
-    async def _check_timeout(self):
-        """检查连接超时"""
-        try:
-            while not self.stop_event.is_set():
-                last_activity_time = self.last_activity_time
-                if self.need_bind:
-                    last_activity_time = self.first_activity_time
-
-                # 检查是否超时（只有在时间戳已初始化的情况下）
-                if last_activity_time > 0.0:
-                    current_time = time.time() * 1000
-                    if current_time - last_activity_time > self.timeout_seconds * 1000:
-                        if not self.stop_event.is_set():
-                            self.logger.bind(tag=TAG).info("连接超时，准备关闭")
-                            # 设置停止事件，防止重复处理
-                            self.stop_event.set()
-                            # 使用 try-except 包装关闭操作，确保不会因为异常而阻塞
-                            try:
-                                await self.close(self.websocket)
-                            except Exception as close_error:
-                                self.logger.bind(tag=TAG).error(
-                                    f"超时关闭连接时出错: {close_error}"
-                                )
-                        break
-                # 每10秒检查一次，避免过于频繁
-                await asyncio.sleep(10)
-        except Exception as e:
-            self.logger.bind(tag=TAG).error(f"超时检查任务出错: {e}")
-        finally:
-            self.logger.bind(tag=TAG).info("超时检查任务已退出")
-
-    async def _check_aec_cache_expiry(self):
-        """定期清理过期的AEC缓存"""
-        try:
-            while not self.stop_event.is_set():
-                if hasattr(self, "aec_audio_cache") and self.aec_audio_cache:
-                    current_time = time.time()
-                    expired_keys = [
-                        ts for ts, cache_time in list(self.aec_audio_cache_time.items())
-                        if current_time - cache_time > 120  # 2分钟过期
-                    ]
-                    for ts in expired_keys:
-                        self.aec_audio_cache.pop(ts, None)
-                        self.aec_audio_cache_time.pop(ts, None)
-                    if expired_keys:
-                        self.logger.bind(tag=TAG).debug(f"[AEC] 清理过期缓存 {len(expired_keys)} 条")
-                # 每30秒检查一次
-                await asyncio.sleep(30)
-        except Exception as e:
-            self.logger.bind(tag=TAG).error(f"AEC缓存清理任务出错: {e}")
 
     @staticmethod
     def _extract_direct_answer_response(arguments_str):
