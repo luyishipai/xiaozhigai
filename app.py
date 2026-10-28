@@ -1,9 +1,4 @@
-"""
-阶段三改造后的入口：用 FastAPI 启动问答服务。
 
-原来的 WebSocketServer + SimpleHttpServer 都删掉了，
-换成通过 uvicorn 启动 http_server_fastapi.py 里的 app。
-"""
 # ── Windows opus.dll 路径修复（必须在所有其他 import 之前执行）──────────────
 # opuslib_next 内部用 ctypes.util.find_library("opus") 查找 DLL，
 # 该函数在 Windows 下只搜索 os.environ['PATH'] 中的目录。

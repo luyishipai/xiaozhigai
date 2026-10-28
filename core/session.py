@@ -17,48 +17,49 @@ if TYPE_CHECKING:
 
 class FakeWebSocket:
     """
-    伪装的 websockets.ServerConnection 对象。
-    只实现 handle 模块用到的 send() 方法，收集数据到列表。
+    HTTP 模式适配器：把 handle 模块的 conn.websocket.send() 调用
+    转化为 asyncio.Queue 的 put() 操作，供 /api/chat SSE 流式消费。
 
-    当 sendAudioHandle 发出 {"type":"tts","state":"stop"} 时，
-    表示 chat() + TTS 全链路完成，设置 completion_event 通知路由层。
+    - bytes  → put(("audio", data))   — opus 音频包
+    - JSON 含 {"type":"tts","state":"stop"} → put(None) — 哨兵，TTS 全链路完成
+    - 其他 JSON → put(("json", data))  — 状态消息（stt / sentence_start / start）
     """
 
     def __init__(self):
-        self.sent: List[Tuple[str, Any]] = []
-        self._lock = asyncio.Lock()
+        self.audio_queue: asyncio.Queue = asyncio.Queue()
         self.closed = False
-        self.completion_event = asyncio.Event()
         self.state = type("State", (), {"name": "OPEN"})()
 
     async def send(self, data):
         """handle 模块调 conn.websocket.send() 时走这里"""
-        async with self._lock:
-            if isinstance(data, bytes):
-                self.sent.append(("audio", data))
-            else:
-                self.sent.append(("json", data))
-                # 检测 TTS 完成信号
-                # sendAudioHandle.sendAudioMessage 在 SentenceType.LAST 时
-                # 调 send_tts_message(conn, "stop", None) → 发出这条 JSON
-                try:
-                    msg = json.loads(data) if isinstance(data, str) else data
-                    if (isinstance(msg, dict)
-                            and msg.get("type") == "tts"
-                            and msg.get("state") == "stop"):
-                        self.completion_event.set()
-                except Exception:
-                    pass
+        if self.closed:
+            return
+        if isinstance(data, bytes):
+            # opus 音频包
+            await self.audio_queue.put(("audio", data))
+        else:
+            # JSON 文本：检测 TTS stop 信号
+            try:
+                msg = json.loads(data) if isinstance(data, str) else data
+                if (isinstance(msg, dict)
+                        and msg.get("type") == "tts"
+                        and msg.get("state") == "stop"):
+                    # 哨兵值 None：通知 SSE 消费者 TTS 全链路完成
+                    await self.audio_queue.put(None)
+                    return
+            except Exception:
+                pass
+            await self.audio_queue.put(("json", data))
 
     async def close(self):
         self.closed = True
         self.state.name = "CLOSED"
+        # 确保消费者不会永远阻塞在 queue.get()
+        await self.audio_queue.put(None)
 
-    def get_and_clear(self):
-        """FastAPI 路由取走所有输出"""
-        items = self.sent[:]
-        self.sent.clear()
-        return items
+    def reset_queue(self):
+        """为新一轮对话重置队列（多轮对话复用同一 session）"""
+        self.audio_queue = asyncio.Queue()
 
 class SessionManager:
     """
@@ -89,7 +90,7 @@ class SessionManager:
             self._memory,
             self._intent,
         )
-        # 注入伪 WebSocket（关键！handle 模块调 conn.websocket.send() 走这里）
+        # 注入适配器（关键！handle 模块调 conn.websocket.send() → asyncio.Queue.put()）
         conn.websocket = FakeWebSocket()
         conn.loop = asyncio.get_running_loop()
         conn.headers = {}  # HTTP 场景无 WS headers，给空 dict

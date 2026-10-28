@@ -82,6 +82,8 @@ class TTSProviderBase(ABC):
         # 流式滑动窗口：待匹配的缓存文本
         self._pending_prefix = ""
         self.tts_text_buff = []
+        # 单次发送给 TTS 的最大字符数，防止超长文本触发 API 报错
+        self._max_tts_text_len = int(config.get("max_tts_text_len", 150))
         self.punctuations = (
             "。",
             "？",
@@ -515,6 +517,17 @@ class TTSProviderBase(ABC):
                 self.is_first_sentence = False
 
             return segment_text
+        elif len(current_text) >= self._max_tts_text_len:
+            # 没找到标点但文本已超长（如 Markdown 表格/长列表段），
+            # 强制按最大长度切分，防止 TTS API 报 TextTooLong
+            segment_text_raw = current_text[: self._max_tts_text_len]
+            segment_text = textUtils.get_string_no_punctuation_or_emoji(
+                segment_text_raw
+            )
+            self.processed_chars += len(segment_text_raw)
+            if self.is_first_sentence:
+                self.is_first_sentence = False
+            return segment_text
         elif self.tts_stop_request and current_text:
             segment_text = current_text
             self.is_first_sentence = True  # 重置标志
@@ -565,6 +578,12 @@ class TTSProviderBase(ABC):
         if remaining_text:
             segment_text = textUtils.get_string_no_punctuation_or_emoji(remaining_text)
             if segment_text:
+                # 超长文本分段发送，防止 TTS API 报 TextTooLong
+                max_len = self._max_tts_text_len
+                while len(segment_text) > max_len:
+                    chunk = segment_text[:max_len]
+                    segment_text = segment_text[max_len:]
+                    self.to_tts_stream(chunk, opus_handler=opus_handler)
                 self.to_tts_stream(segment_text, opus_handler=opus_handler)
                 self.processed_chars += len(full_text)
                 return True

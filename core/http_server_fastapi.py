@@ -4,11 +4,12 @@ FastAPI 入口：替换原 websocket_server + http_server。
 提供三个核心接口：
   POST /api/asr    音频→文字
   POST /api/tts    文字→音频
-  POST /api/chat   完整对话（文字输入 或 音频输入）
+  POST /api/chat   完整对话（SSE 流式返回）
 
 设计要点：
   - 每个请求自动创建/复用 ConnectionHandler 会话
-  - handle 模块完全不动（通过 FakeWebSocket 收集输出）
+  - handle 模块完全不动（通过 FakeWebSocket 适配器 → asyncio.Queue）
+  - /api/chat 用 StreamingResponse SSE 流式返回，文字实时推送、音频最终汇总
   - TTS 流控、function_call、intent、memory 全部复用
 """
 import asyncio
@@ -294,7 +295,7 @@ async def api_tts(req: ChatTextRequest):
         if conn:
             await session_manager.close_session(session_id)
 
-# ─── 3. Chat 接口（核心！复用完整链路） ──────────────────────────────────
+# ─── 3. Chat 接口（核心！SSE 流式返回） ───────────────────────────────
 
 @app.post("/api/chat", summary="完整问答")
 async def api_chat(
@@ -304,16 +305,26 @@ async def api_chat(
     output_audio: bool = Form(True, description="是否返回TTS音频"),
 ):
     """
-    完整问答流程：
-    - 音频模式：wav → ASR → LLM → TTS → 返回
-    - 文字模式：text → LLM → TTS → 返回
+    完整问答流程（SSE 流式返回）：
+    - 音频模式：wav → ASR → LLM → TTS → 流式返回
+    - 文字模式：text → LLM → TTS → 流式返回
     - 多轮对话：传同一个 session_id
+
+    SSE 事件格式（每行 data: {JSON}\\n\\n）：
+    - {"type":"stt","text":"..."}          — ASR 识别结果
+    - {"type":"tts","state":"start"}       — TTS 开始
+    - {"type":"tts","state":"sentence_start","text":"..."} — 逐句回复文本
+    - {"type":"agent_tool","event":"tool_call","name":"search"}  — Agent 调用工具
+    - {"type":"agent_tool","event":"tool_result","content":"..."} — 工具执行结果
+    - {"type":"done","session_id":"...","reply_text":"...","audio_base64":"..."} — 全部完成
+    - {"type":"error","message":"..."}     — 异常
     """
     from core.handle.receiveAudioHandle import startToChat
 
     conn = None
     _session_lock = None
     _lock_acquired = False
+    _lock_handed_off = False
     try:
         # ① 获取或创建会话
         if session_id:
@@ -336,7 +347,6 @@ async def api_chat(
                         status_code=429,
                         detail="该会话正在处理另一请求，请稍后重试"
                     )
-            # 刷新活动时间，防止被 cleanup_expired 误清理
             conn.last_activity_time = time.time() * 1000
 
         # ② 如果有音频，先 ASR
@@ -345,7 +355,6 @@ async def api_chat(
             audio_bytes = await file.read()
             pcm_bytes = wav_to_pcm16k(audio_bytes)
 
-            # 优先使用批量识别（流式 ASR 如 DoubaoStream 在 HTTP 场景下需要）
             asr = conn._asr
             if hasattr(asr, "batch_recognize"):
                 asr_text = await asr.batch_recognize(pcm_bytes, asr.rate)
@@ -364,72 +373,105 @@ async def api_chat(
 
         logger.bind(tag=TAG).info(f"Chat 输入: {user_input[:60]}")
 
-        # ③ 调 startToChat —— 复用整个意图分析 → function_call → chat → TTS 链路！
-        # 清除上一次的完成信号（多轮对话复用同一 session）
-        conn.websocket.completion_event.clear()
+        # ③ 重置队列 + 调 startToChat —— 复用整个意图分析 → function_call → chat → TTS 链路！
+        conn.websocket.reset_queue()
         await startToChat(conn, user_input)
 
-        # 等待 TTS 全链路完成：chat() → tts_text_queue → TTS线程 → sendAudioMessage
-        # → send_tts_message(conn, "stop") → FakeWebSocket 收到 stop → completion_event.set()
-        try:
-            await asyncio.wait_for(
-                conn.websocket.completion_event.wait(), timeout=30
-            )
-        except asyncio.TimeoutError:
-            logger.bind(tag=TAG).warning("TTS 完成超时(30s)，返回已有数据")
+        # ④ SSE 流式返回：从 asyncio.Queue 实时消费
+        _lock_handed_off = True
+        _lock = _session_lock
+        _acquired = _lock_acquired
+        _conn = conn
+        _sid = session_id
+        _asr_val = asr_text
+        _want_audio = output_audio
 
-        # ④ 从 FakeWebSocket 取输出
-        sent_items = conn.websocket.get_and_clear()
-        reply_text = ""
-        audio_chunks = []
+        async def sse_stream():
+            """从 FakeWebSocket.audio_queue 实时取出数据，yield SSE 事件"""
+            reply_text = ""
+            asr_result = _asr_val
+            audio_chunks = []
+            try:
+                while True:
+                    item = await asyncio.wait_for(
+                        _conn.websocket.audio_queue.get(), timeout=60
+                    )
+                    if item is None:
+                        # 哨兵值 None → TTS 全链路完成
+                        break
+                    item_type, item_data = item
+                    if item_type == "json":
+                        try:
+                            msg = (json.loads(item_data)
+                                   if isinstance(item_data, str) else item_data)
+                            if isinstance(msg, dict):
+                                if msg.get("type") == "stt":
+                                    asr_result = msg.get("text", asr_result)
+                                if (msg.get("type") == "tts"
+                                        and msg.get("state") == "sentence_start"):
+                                    t = msg.get("text")
+                                    if t:
+                                        reply_text += t
+                            # 转发 JSON 事件给前端
+                            yield f"data: {json.dumps(msg, ensure_ascii=False)}\n\n"
+                        except Exception:
+                            pass
+                    elif item_type == "audio":
+                        if _want_audio:
+                            audio_chunks.append(item_data)
 
-        for item_type, item_data in sent_items:
-            if item_type == "json":
-                try:
-                    msg = json.loads(item_data) if isinstance(item_data, str) else item_data
-                    if isinstance(msg, dict):
-                        if msg.get("type") == "stt":
-                            asr_text = msg.get("text", asr_text)
-                        # 从 TTS sentence_start 消息提取回复文本
-                        if msg.get("type") == "tts" and msg.get("state") == "sentence_start":
-                            t = msg.get("text")
-                            if t:
-                                reply_text += t
-                except Exception:
-                    pass
-            elif item_type == "audio":
-                audio_chunks.append(item_data)
+                # 发送最终汇总事件
+                if not reply_text and _conn.dialogue:
+                    reply_text = _conn.dialogue.get_last_assistant()
 
-        # 如果没从 TTS 消息提取到文本，从 dialogue 拿最后一条 assistant 消息
-        if not reply_text and conn.dialogue:
-            reply_text = conn.dialogue.get_last_assistant()
+                import base64
+                final = {
+                    "type": "done",
+                    "session_id": _sid,
+                    "asr_text": asr_result,
+                    "reply_text": reply_text,
+                }
+                if _want_audio and audio_chunks:
+                    wav_bytes = opus_chunks_to_wav_bytes(
+                        audio_chunks, _conn.sample_rate
+                    )
+                    if wav_bytes:
+                        final["audio_base64"] = base64.b64encode(wav_bytes).decode("utf-8")
+                        final["audio_type"] = "wav"
+                yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
 
-        # ⑤ 组装响应
-        import base64
-        response_body = {
-            "code": 0,
-            "session_id": session_id,
-            "asr_text": asr_text,
-            "reply_text": reply_text,
-        }
+            except asyncio.TimeoutError:
+                logger.bind(tag=TAG).warning("SSE 流等待超时(60s)")
+                yield f"data: {json.dumps({'type':'timeout','message':'TTS处理超时'}, ensure_ascii=False)}\n\n"
+            except Exception as e:
+                logger.bind(tag=TAG).error(f"SSE 流异常: {e}", exc_info=True)
+                yield f"data: {json.dumps({'type':'error','message':str(e)}, ensure_ascii=False)}\n\n"
+            finally:
+                # 释放会话并发锁（正常流程在这里释放）
+                if _acquired and _lock:
+                    _lock.release()
 
-        if output_audio and audio_chunks:
-            wav_bytes = opus_chunks_to_wav_bytes(audio_chunks, conn.sample_rate)
-            if wav_bytes:
-                response_body["audio_base64"] = base64.b64encode(wav_bytes).decode("utf-8")
-                response_body["audio_type"] = "wav"
+        return StreamingResponse(
+            sse_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Session-Id": session_id,
+                "X-Accel-Buffering": "no",
+            },
+        )
 
-        response = JSONResponse(response_body)
-        response.headers["X-Session-Id"] = session_id
-        return response
-
+    except HTTPException:
+        # 异常发生时释放锁（正常流程由 sse_stream finally 释放）
+        if not _lock_handed_off and _lock_acquired and _session_lock:
+            _session_lock.release()
+        raise
     except Exception as e:
+        if not _lock_handed_off and _lock_acquired and _session_lock:
+            _session_lock.release()
         logger.bind(tag=TAG).error(f"Chat 异常: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # 释放会话并发锁（仅对复用的会话有效）
-        if _lock_acquired:
-            _session_lock.release()
 
 # ─── 4. 会话管理接口 ─────────────────────────────────────────────────────
 
@@ -455,3 +497,13 @@ async def api_delete_session(session_id: str):
 @app.get("/health", summary="健康检查")
 async def health():
     return JSONResponse({"status": "ok"})
+
+# ─── 欢迎消息 ────────────────────────────────────────────────────────────
+
+@app.get("/api/welcome", summary="获取欢迎消息")
+async def api_welcome():
+    """前端页面加载时调用，返回欢迎/引导消息。"""
+    return JSONResponse({
+        "type": "welcome",
+        "text": "请先输入您的身份（如：我是小明）",
+    })
