@@ -4,20 +4,15 @@ import wave
 import uuid
 import json
 import time
-import queue
 import shutil
-import asyncio
 import tempfile
 import traceback
-import threading
 
 from abc import ABC, abstractmethod
 from config.logger import setup_logging
-from core.providers.asr.dto.dto import InterfaceType
 from core.handle.receiveAudioHandle import startToChat
-from core.handle.reportHandle import enqueue_asr_report
+# reportHandle removed — 上报功能在 HTTP 模式下不使用
 from core.utils.util import remove_punctuation_and_length
-from core.handle.receiveAudioHandle import handleAudioMessage
 from typing import Optional, Tuple, List, NamedTuple, TYPE_CHECKING
 
 
@@ -34,112 +29,47 @@ class ASRProviderBase(ABC):
 
     # 打开音频通道
     async def open_audio_channels(self, conn: "ConnectionHandler"):
-        conn.asr_priority_thread = threading.Thread(
-            target=self.asr_text_priority_thread, args=(conn,), daemon=True
-        )
-        conn.asr_priority_thread.start()
+        """HTTP 模式下不需要 ASR 消费线程（音频通过 /api/asr 或 /api/chat 直接调用）"""
+        pass
 
-    # 有序处理ASR音频
+    # 有序处理ASR音频（HTTP 模式保留空实现，流式 ASR 子类可覆盖）
     def asr_text_priority_thread(self, conn: "ConnectionHandler"):
-        while not conn.stop_event.is_set():
-            try:
-                message = conn.asr_audio_queue.get(timeout=1)
-                future = asyncio.run_coroutine_threadsafe(
-                    handleAudioMessage(conn, message),
-                    conn.loop,
-                )
-                future.result()
-            except queue.Empty:
-                continue
-            except Exception as e:
-                logger.bind(tag=TAG).error(
-                    f"处理ASR文本失败: {str(e)}, 类型: {type(e).__name__}, 堆栈: {traceback.format_exc()}"
-                )
-                continue
+        pass
 
     # 接收音频
     async def receive_audio(self, conn: "ConnectionHandler", pcm_frame, audio_have_voice):
-        if conn.client_listen_mode == "manual":
-            # 手动模式：缓存音频用于ASR识别
-            conn.asr_audio.append(pcm_frame)
-        else:
-            # 自动/实时模式：使用VAD检测
-            conn.asr_audio.append(pcm_frame)
+        """接收音频帧（HTTP 模式下流式 ASR 子类可覆盖）。
 
-            # 如果没有语音，且之前也没有声音，缓存部分音频
-            if not audio_have_voice and not conn.client_have_voice:
-                conn.asr_audio = conn.asr_audio[-10:]
-                return
-
-            # 自动模式下通过VAD检测到语音停止时触发识别
-            if conn.asr.interface_type != InterfaceType.STREAM and conn.client_voice_stop:
-                # 直接使用asr_audio中的PCM数据
-                pcm_bytes = b"".join(conn.asr_audio)
-                # 检查是否有足够的音频数据（每帧1920字节，15帧约28800字节）
-                if len(pcm_bytes) > 1920 * 15:
-                    await self.handle_voice_stop(conn, [pcm_bytes])
-                conn.reset_audio_states()
+        精简版：移除 VAD/voiceprint 逻辑（HTTP 模式不需要）。
+        """
+        conn.asr_audio.append(pcm_frame)
 
     # 处理语音停止
     async def handle_voice_stop(self, conn: "ConnectionHandler", asr_audio_task: List[bytes]):
-        """并行处理ASR和声纹识别"""
+        """处理ASR识别（精简版：移除声纹识别并行逻辑）"""
         try:
             total_start_time = time.monotonic()
 
-            # 数据已经是PCM直接使用
-            pcm_data = asr_audio_task
-            combined_pcm_data = b"".join(pcm_data)
+            asr_task = self.speech_to_text_wrapper(asr_audio_task, conn.session_id)
+            asr_result = await asr_task
 
-            # 预先准备WAV数据
-            wav_data = None
-            if conn.voiceprint_provider and combined_pcm_data:
-                wav_data = self._pcm_to_wav(combined_pcm_data)
-
-            # 定义ASR任务
-            asr_task = self.speech_to_text_wrapper(
-                asr_audio_task, conn.session_id
-            )
-
-            if conn.voiceprint_provider and wav_data:
-                voiceprint_task = conn.voiceprint_provider.identify_speaker(
-                    wav_data, conn.session_id
-                )
-                # 并发等待两个结果
-                asr_result, voiceprint_result = await asyncio.gather(
-                    asr_task, voiceprint_task, return_exceptions=True
-                )
-            else:
-                asr_result = await asr_task
-                voiceprint_result = None
-
-            # 记录识别结果 - 检查是否为异常
             if isinstance(asr_result, Exception):
                 logger.bind(tag=TAG).error(f"ASR识别失败: {asr_result}")
                 raw_text = ""
             else:
                 raw_text, _ = asr_result
 
-            if isinstance(voiceprint_result, Exception):
-                logger.bind(tag=TAG).error(f"声纹识别失败: {voiceprint_result}")
-                speaker_name = ""
-            else:
-                speaker_name = voiceprint_result
+            speaker_name = ""
 
             # 判断 ASR 结果类型
             if isinstance(raw_text, dict):
                 # FunASR 返回的 dict 格式
-                if speaker_name:
-                    raw_text["speaker"] = speaker_name
-
-                # 记录识别结果
                 if raw_text.get("language"):
                     logger.bind(tag=TAG).info(f"识别语言: {raw_text['language']}")
                 if raw_text.get("emotion"):
                     logger.bind(tag=TAG).info(f"识别情绪: {raw_text['emotion']}")
                 if raw_text.get("content"):
                     logger.bind(tag=TAG).info(f"识别文本: {raw_text['content']}")
-                if speaker_name:
-                    logger.bind(tag=TAG).info(f"识别说话人: {speaker_name}")
 
                 # 转换为 JSON 字符串用于下游
                 enhanced_text = json.dumps(raw_text, ensure_ascii=False)
@@ -148,8 +78,6 @@ class ASRProviderBase(ABC):
                 # 其他 ASR 返回的纯文本
                 if raw_text:
                     logger.bind(tag=TAG).info(f"识别文本: {raw_text}")
-                if speaker_name:
-                    logger.bind(tag=TAG).info(f"识别说话人: {speaker_name}")
 
                 # 构建包含说话人信息的JSON字符串
                 enhanced_text = self._build_enhanced_text(raw_text, speaker_name)
@@ -164,14 +92,9 @@ class ASRProviderBase(ABC):
             self.stop_ws_connection()
 
             if text_len > 0:
-                audio_snapshot = asr_audio_task.copy()
-                enqueue_asr_report(conn, enhanced_text, audio_snapshot)
-                # 使用自定义模块进行上报
                 await startToChat(conn, enhanced_text)
         except Exception as e:
             logger.bind(tag=TAG).error(f"处理语音停止失败: {e}")
-            import traceback
-
             logger.bind(tag=TAG).debug(f"异常详情: {traceback.format_exc()}")
 
     def _build_enhanced_text(self, text: str, speaker_name: Optional[str]) -> str:

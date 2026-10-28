@@ -16,8 +16,7 @@ from abc import ABC, abstractmethod
 from config.logger import setup_logging
 from core.utils import opus_encoder_utils
 from core.utils.tts import MarkdownCleaner, convert_percentage_to_range
-from core.utils.output_counter import add_device_output
-from core.handle.reportHandle import enqueue_tts_report
+# reportHandle removed — 上报功能在 HTTP 模式下不使用
 from core.handle.sendAudioHandle import sendAudioMessage
 from core.utils.util import audio_bytes_to_data_stream, audio_to_data_stream
 from core.providers.tts.dto.dto import (
@@ -45,7 +44,6 @@ class TTSProviderBase(ABC):
         self.tts_audio_queue = queue.Queue()
         self.tts_audio_first_sentence = True
         self.before_stop_play_files = []
-        self.report_on_last = False
         # sentence_id 到文本的映射，用于流式TTS获取正确的字幕文本
         self._sentence_text_map = {}
         # 加载替换词，用于一次性正则替换
@@ -414,9 +412,6 @@ class TTSProviderBase(ABC):
                 continue
 
     def _audio_play_priority_thread(self):
-        # 需要上报的文本和音频列表
-        enqueue_text = None
-        enqueue_audio = []
         while not self.conn.stop_event.is_set():
             text = None
             try:
@@ -434,30 +429,7 @@ class TTSProviderBase(ABC):
 
                 if self.conn.client_abort:
                     logger.bind(tag=TAG).debug("收到打断信号，跳过当前音频数据")
-                    enqueue_text, enqueue_audio = None, []
                     continue
-
-                # 收到下一个文本开始或会话结束时进行上报
-                if sentence_type is not SentenceType.MIDDLE:
-                    if self.report_on_last:
-                        # 累积模式：适用于全程只有一个语音流的TTS（如seed-tts-2.0）
-                        # FIRST时只记录文本，音频持续累积，仅在LAST时统一上报
-                        if text:
-                            enqueue_text = text
-                        if sentence_type == SentenceType.LAST:
-                            enqueue_tts_report(self.conn, enqueue_text, enqueue_audio)
-                            enqueue_audio = []
-                            enqueue_text = None
-                    else:
-                        # 非累积模式：每个句子分别上报
-                        if enqueue_text is not None:
-                            enqueue_tts_report(self.conn, enqueue_text, enqueue_audio)
-                        enqueue_audio = []
-                        enqueue_text = text
-
-                # 收集上报音频数据
-                if isinstance(audio_datas, bytes):
-                    enqueue_audio.append(audio_datas)
 
                 # 发送音频
                 future = asyncio.run_coroutine_threadsafe(
@@ -465,10 +437,6 @@ class TTSProviderBase(ABC):
                     self.conn.loop,
                 )
                 future.result()
-
-                # 记录输出和报告
-                if self.conn.max_output_size > 0 and text:
-                    add_device_output(self.conn.headers.get("device-id"), len(text))
 
             except Exception as e:
                 logger.bind(tag=TAG).error(f"audio_play_priority_thread: {text} {e}")

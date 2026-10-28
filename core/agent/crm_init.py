@@ -16,18 +16,40 @@ from langchain_community.document_loaders import (
 
 logger = logging.getLogger(__name__)
 
-# ─── 绝对路径 ─────────────────────────────────────────────
+# ─── 4.6: 数据文件移至 data/ 目录 ────────────────────────
 _AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(_AGENT_DIR))  # xiaozhi-server/
-_TRAVEL_DB_PATH = os.path.join(_AGENT_DIR, "travel.db")
-_VECTORSTORE_DIR = os.path.join(_AGENT_DIR, "data", "vectorstore")
+_DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
+_TRAVEL_DB_PATH = os.path.join(_DATA_DIR, "travel.db")
+_VECTORSTORE_DIR = os.path.join(_DATA_DIR, "vectorstore")
 _ENV_FILE = os.path.join(_PROJECT_ROOT, "config", "agent.env")
 
 # ─── 加载环境变量 ─────────────────────────────────────────
 dotenv.load_dotenv(_ENV_FILE)
 
-# ─── SQL 数据库 ───────────────────────────────────────────
-db = SQLDatabase.from_uri(f"sqlite:///{_TRAVEL_DB_PATH}")
+# ─── SQL 数据库（4.7: 延迟初始化 + 重连机制）─────────────
+_db = None
+_db_uri = f"sqlite:///{_TRAVEL_DB_PATH}"
+
+
+def get_db():
+    """获取 SQLDatabase 单例，连接断开时自动重连。"""
+    global _db
+    if _db is None:
+        _db = SQLDatabase.from_uri(_db_uri)
+    return _db
+
+
+def db_run_safe(sql: str):
+    """执行 SQL 查询，失败时尝试重连一次。"""
+    global _db
+    try:
+        return get_db().run(sql)
+    except Exception as e:
+        logger.warning(f"DB 查询失败，尝试重连: {e}")
+        _db = None  # 重置，下次调用会重新创建
+        return get_db().run(sql)
+
 
 # ─── SQL 生成 LLM（qwen-plus）────────────────────────────
 llm = ChatOpenAI(
@@ -56,25 +78,35 @@ query_prompt_template = ChatPromptTemplate.from_messages([
 
 def search_database(user_input: str):
     """根据用户身份声明自动生成SQL并返回原始元组列表。"""
+    _db = get_db()
     prompt = query_prompt_template.invoke({
-        "dialect": db.dialect,
+        "dialect": _db.dialect,
         "top_k": 10,
-        "table_info": db.get_table_info(),
+        "table_info": _db.get_table_info(),
         "input": user_input,
     })
     query = llm.invoke(prompt).content
     if not query or query.strip() in ['""', '"', 'None']:
         return "无用户信息"
-    return db.run(query)
+    return db_run_safe(query)
 
 
 def update_database(sql: str):
     """执行 INSERT/UPDATE/DELETE 等写操作 SQL。"""
     try:
-        db.run(sql)
+        get_db().run(sql)
         logger.info(f"[DB写入成功] {sql}")
     except Exception as e:
         logger.error(f"[DB写入失败] {e}")
+        raise
+
+
+# 兼容旧引用
+db = type("DBProxy", (), {
+    "get_table_info": lambda self: get_db().get_table_info(),
+    "run": lambda self, sql: db_run_safe(sql),
+    "dialect": property(lambda self: get_db().dialect),
+})()
 
 
 # ─── 向量数据库 ───────────────────────────────────────────
@@ -157,8 +189,12 @@ def get_vectorstore(user_id):
 
 
 def search_documents(user_id, query, k=3):
-    """在用户文档中搜索相关内容"""
-    vectorstore = get_vectorstore(user_id)
-    if vectorstore is None:
+    """在用户文档中搜索相关内容（4.7: 带错误处理）"""
+    try:
+        vectorstore = get_vectorstore(user_id)
+        if vectorstore is None:
+            return []
+        return vectorstore.similarity_search(query, k=k)
+    except Exception as e:
+        logger.error(f"向量搜索失败 user_id={user_id}: {e}")
         return []
-    return vectorstore.similarity_search(query, k=k)

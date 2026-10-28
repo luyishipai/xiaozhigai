@@ -50,19 +50,15 @@ async def lifespan(app: FastAPI):
     config = await load_config()
     _app_config = config
 
-    # 工厂层初始化（和原 websocket_server 一样！）
+    # 工厂层初始化（精简版：仅 ASR，TTS 在 ConnectionHandler 内初始化）
     modules = initialize_modules(
         logger, config,
-        init_vad=True, init_asr=True, init_llm=True, init_memory=True, init_intent=True, init_tts=False
+        init_asr=True,
     )
 
     session_manager = SessionManager(
         config=config,
-        vad=modules["vad"],
         asr=modules["asr"],
-        llm=modules["llm"],
-        memory=modules["memory"],
-        intent=modules["intent"],
     )
 
     # 定时清理空闲会话（每 5 分钟跑一次，清理超过 30 分钟无活动的会话）

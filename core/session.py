@@ -67,13 +67,9 @@ class SessionManager:
     按 session_id 持有 ConnectionHandler 实例，支持多轮对话。
     """
 
-    def __init__(self, config, vad, asr, llm, memory, intent):
+    def __init__(self, config, asr):
         self.config = config
-        self._vad = vad
         self._asr = asr
-        self._llm = llm
-        self._memory = memory
-        self._intent = intent
         self._sessions: Dict[str, "ConnectionHandler"] = {}
         self._session_locks: Dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
@@ -84,11 +80,7 @@ class SessionManager:
 
         conn = ConnectionHandler(
             self.config,
-            self._vad,
             self._asr,
-            self._llm,
-            self._memory,
-            self._intent,
         )
         # 注入适配器（关键！handle 模块调 conn.websocket.send() → asyncio.Queue.put()）
         conn.websocket = FakeWebSocket()
